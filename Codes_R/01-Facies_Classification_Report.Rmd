@@ -1,0 +1,772 @@
+---
+title: "Facies Classification"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, cache=FALSE}
+# Clean the environment with the following command
+rm(list = ls())
+
+```
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook for the [Facies Classification Contest](https://github.com/seg/2016-ml-contest). In this notebook, I will try different classification methods that involve [decision trees](https://en.wikipedia.org/wiki/Decision_tree_learning) and [ensemble classifiers](https://en.wikipedia.org/wiki/Ensemble_learning).
+
+This data is from the [2016 ML contest](https://github.com/seg/2016-ml-contest), with the focus for *Facies Classification*.
+
+The provided data is a CSV file with well logs information from different wells. There are 5 well logs and 2 indicators:
+
+* Gamma ray (GR)
+* Resistivity (ILD\_log10)
+* Photoelectric effect (PE)
+* Neutron-density porosity difference (DeltaPHI)
+* Average neutron-density porosity (PHIND)
+* Nonmarine/marine indicator (NM\_M)
+* Relative position (RELPOS)
+
+The goal is to train a model able to classify 9 different types of rocks, as listed in the following table:
+
+| Facies | Description | Label | Adjacent Facies|
+| :---:  |    :---:    | :---: |      :---:     |
+|   1    | Nonmarine Sandstone | SS | 2 |
+|   2    | Nonmarine coarse siltstone | CSiS | 1,3 |
+|   3    | Nonmarine fine siltstone | FSiS | 2 |
+|   4    | Marine siltstone and shale | SiSh | 5 |
+|   5    | Mudstone | MS | 4,6 |
+|   6    | Wackestone | WS | 5,7,8 |
+|   7    | Dolomite | D | 6,8 |
+|   8    | Packstone-grainstone | PS | 6,7,9 |
+|   9    | Phylloid-algal bafflestone | BS | 7,8 |
+
+So, let's take a look at the data!
+
+## Simple Modelling
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r message=FALSE, cache=FALSE}
+# Load .csv data to dataframe
+data = read.csv("../Data/facies_vectors.csv")
+head(data, 10)
+```
+
+Now I will create the list of features and facies names for future use:
+
+```{r, fig.align="center",  fig.width=7, fig.height=7, message=FALSE, cache=FALSE}
+features = c('GR','ILD_log10','DeltaPHI','PHIND','PE','NM_M','RELPOS')
+well_logs = c('GR','ILD_log10','DeltaPHI','PHIND','PE')
+facies_names = c('SS', 'CSiS', 'FSiS', 'SiSh', 'MS', 'WS', 'D', 'PS', 'BS')
+facies_colors = c("1" = '#F4D03F', "2" = '#F5B041', "3" = '#DC7633', "4" = '#6E2C00',
+                  "5" = '#1B4F72', "6" = '#2E86C1', "7" = '#AED6F1', "8" = '#A569BD',
+                  "9" = '#196F3D')
+target = "Facies"
+testWell = "SHANKLE"
+
+source("Utils.R")
+pright <- plotwelllogs(datap = data, wname = testWell, dz = "Depth", wlogs = well_logs,
+             facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+```
+```{r,  fig.width=7, fig.height=7, fig.align="center", message=FALSE, cache=FALSE}
+# Removing well "Recruit F9" from the data:
+plotwelllogs(datap = data, wname = "Recruit F9", dz = "Depth", wlogs = well_logs,
+             facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+dataf = data[data$Well.Name != 'Recruit F9',]
+unique(dataf$Well.Name)
+```
+
+Split data into train and test datasets by selecting the well *SHANKLE* as the blind well for validation:
+
+```{r message=FALSE, cache=FALSE}
+# For the xgboost package, target must be from 0 to num_class - 1
+temp <- dataf
+temp$Facies = temp$Facies - 1
+
+# Separating the "blind well"
+train = temp[temp$Well.Name != testWell, ]
+test = temp[temp$Well.Name == testWell, ]
+print(nrow(train))
+print(nrow(test))
+print(nrow(dataf) - (nrow(train) + nrow(test)))
+```
+
+For the gradient boosting classifier, I will use the [xgboost](https://cran.r-project.org/web/packages/xgboost/index.html) package. Let's load the libraries:
+
+```{r message=FALSE, cache=FALSE}
+library(xgboost, quietly = TRUE, verbose = FALSE)
+library(Matrix, quietly = TRUE, verbose = FALSE)
+library(archdata, quietly = TRUE, verbose = FALSE) 
+library(caret, quietly = TRUE, verbose = FALSE) 
+library(dplyr, quietly = TRUE, verbose = FALSE)   
+library(Ckmeans.1d.dp, quietly = TRUE, verbose = FALSE) 
+library(e1071, quietly = TRUE, verbose = FALSE)
+library(ggplot2, quietly = TRUE, verbose = FALSE)
+library(gridExtra, quietly = TRUE, verbose = FALSE)
+library(ggpubr, quietly = TRUE, verbose = FALSE)
+library(gplots, quietly = TRUE, verbose = FALSE)
+library(reshape2, quietly = TRUE, verbose = FALSE)
+library(tidyverse, quietly = TRUE, verbose = FALSE)
+library(GGally, quietly = TRUE, verbose = FALSE)
+library(signal, quietly = TRUE, verbose = FALSE)
+
+```
+
+To use the *xgboost package*, we need to "convert" the training and test datasets to **xgb.DMatrix**:
+
+```{r message=FALSE, cache=FALSE}
+# Converting datasets to xgb.DMatrix
+dtrain = xgb.DMatrix(data.matrix(train[,features]),
+                     label = data.matrix(train$Facies))
+dtest = xgb.DMatrix(data.matrix(test[,features]),
+                    label = data.matrix(test$Facies))
+
+# Calculating number of classes in the data
+numberOfClasses <- length(unique(dataf$Facies))
+
+# Setting up parameters
+param <- list(max_depth = 6, 
+              eta = 1, 
+              silent = 1, 
+              nthread = 2,
+              #subsample = 0.5,
+              objective = "multi:softmax", 
+              eval_metric = "merror", 
+              "num_class" = numberOfClasses) 
+
+# Defining training and evaluation sets
+watchlist <- list(train = dtrain, 
+                  eval = dtest)
+
+# Generating first model using Gradient Boosting Trees
+model01 = xgb.train(param, 
+                    dtrain,
+                    nrounds = 30,
+                    watchlist)
+
+```
+
+
+```{r message=FALSE, cache=FALSE, fig.align="center"}
+# Computing prediction estimations for the test data
+test_pred = predict(model01, 
+                    newdata = data.matrix(test[,features]))
+train_pred = predict(model01, 
+                     newdata = data.matrix(train[,features]))
+
+test$Predictions = test_pred
+
+# confusion matrix of test set
+xtab = createConfusionMatrix(test$Facies + 1, 
+                             test$Predictions + 1)
+xtab = t(xtab)
+rownames(xtab) <- facies_names[1:8]
+colnames(xtab) <- facies_names[1:8]
+plotConfusionMatrix(xtab, relScale = T)
+
+# Confucion matrix an statistical information
+u <- union(test$Predictions + 1, test$Facies + 1)
+t <- table(factor(test$Predictions + 1, u), factor(test$Facies + 1, u))
+
+# Confucion matrix and statistical information
+CM = confusionMatrix(t,
+                     mode = "everything")
+print(CM)
+```
+```{r message=FALSE, cache=FALSE, fig.width = 10, fig.height = 8, fig.align="center"}
+dtemp = test
+dtemp$Predictions <- dtemp$Predictions + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs, 
+             facies = "Facies", classy = "Predictions", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+## Data Imputation
+
+Now, let's do some analysis of the data. First, let's evaluate if there are any missing values on each well log and indicators:
+
+```{r message=FALSE, cache=FALSE}
+A = lapply(features, function(x) cat("Missing values of ", x, ": ", 
+                                     sum(is.na(dataf[, x])), "\n", sep = ""))
+```
+Okay, there are 905 missing values for "*PE*". For now, let's replace the missing data simply by the "PE" column average:
+
+```{r message=FALSE, cache=FALSE}
+dataf[is.na(dataf[,"PE"]), "PE"] <- mean(dataf[,"PE"], na.rm = TRUE)
+
+cat("Missing values of PE:", sum(is.na(dataf[, "PE"])))
+```
+
+Now, let's check all the well logs and facies classification for all the wells. The function *plotwelllogs* can be loaded from the file *Utils.R*:
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=7, fig.align="center"}
+wellname = unique(dataf$Well.Name)
+for (ii in wellname){
+  plotwelllogs(datap = dataf, wname = ii, dz = "Depth", wlogs = well_logs,
+               facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+}
+
+# This function is just to save the legend in a variable to use later
+pright <- getLegend(data, "CHURCHMAN BIBLE", "Depth", well_logs, "Facies",
+                    facies_colors, facies_names)
+```
+
+### Data imputation using regression models
+
+The **PE** for the wells *Alexander D* and *Kimzey A* are, actually, missing. Earlier I replaced the missing values by the average of the whole dataset, but it shows to be a poor solution. Instead, I'll try now to replace the missing values by a **linear regression** prediction over the other well logs available. For that, we remove the "damaged" wells from the data, train a linear regression model, and do the predictions on the desired wells.
+
+```{r message=FALSE, cache=FALSE}
+# Se3lecting list of "good" and "damaged" wells
+dwells = c("ALEXANDER D", "KIMZEY A") # "Damaged" wells
+gwells = setdiff(wellname, dwells)    # Good wells
+gwells = setdiff(gwells, testWell)    # Good wells
+
+# Creating linear model and making predictions
+lmModel <- lm(PE ~ GR + ILD_log10 + DeltaPHI + PHIND,
+              data = dataf[dataf$Well.Name %in% c(gwells), ])
+```
+
+Let's check the solution over the test well:
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=7, fig.align="center"}
+pred = predict.lm(lmModel, dataf[dataf$Well.Name %in% c(testWell), ])
+testlm = dataf[dataf$Well.Name %in% testWell, ]
+testlm[ , "PE"] <- pred
+
+plotwelllogs(datap = dataf, wname = testWell, dz = "Depth", wlogs = well_logs,
+               facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+plotwelllogs(datap = testlm, wname = testWell, dz = "Depth", wlogs = well_logs,
+               facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+```
+
+Retrain the linear regression with all the good wells:
+
+```{r message=FALSE, cache=FALSE}
+# Se3lecting list of "good" and "damaged" wells
+dwells = c("ALEXANDER D", "KIMZEY A") # "Damaged" wells
+gwells = setdiff(wellname, dwells)    # Good wells
+
+# Creating linear model and making predictions
+lmModel <- lm(PE ~ GR + ILD_log10 + DeltaPHI + PHIND,
+              data = dataf[dataf$Well.Name %in% c(gwells), ])
+```
+
+Predicting the **PE** for the wells with missing values:
+
+```{r message=FALSE, cache=FALSE}
+predictions = predict.lm(lmModel, dataf[dataf$Well.Name %in% c(dwells), ])
+datalm <- dataf
+datalm[which(datalm$Well.Name %in% c(dwells)), "PE"] <- predictions
+cat("Missing values of PE:", sum(is.na(datalm[, "PE"])))
+```
+
+Let's make the plot for both wells:
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=7, fig.align="center"}
+for (ii in dwells){
+  plotwelllogs(datap = datalm, wname = ii, dz = "Depth", wlogs = well_logs,
+               facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+  plotwelllogs(datap = dataf, wname = ii, dz = "Depth", wlogs = well_logs,
+               facies = "Facies", fcolor = facies_colors, fnames = facies_names)
+}
+```
+
+Okay, good. Let's recreate the *gradient boosting model* with this new dataset. First, after the data imputation, split the data into test and train sets:
+
+```{r message=FALSE, cache=FALSE}
+# For the xgboost package, target must be from 0 to num_class - 1
+temp <- datalm
+temp$Facies = temp$Facies - 1
+
+# Splitting data
+trainlm = temp[temp$Well.Name != testWell, ]
+testlm = temp[temp$Well.Name == testWell, ]
+```
+
+Run the *xgboost*:
+
+```{r message=FALSE, cache=FALSE}
+# Converting datasets to xgb.DMatrix
+dtrainlm = xgb.DMatrix(data.matrix(trainlm[,features]),
+                       label = data.matrix(trainlm$Facies))
+dtestlm = xgb.DMatrix(data.matrix(testlm[,features]),
+                      label = data.matrix(testlm$Facies))
+
+# Calculating number of classes in the data
+numberOfClasses <- length(unique(dataf$Facies))
+
+# Setting up parameters
+param <- list(max_depth = 6, 
+              eta = .5, 
+              silent = 1, 
+              nthread = 2,
+              #subsample = 0.5,
+              objective = "multi:softmax", 
+              eval_metric = "merror", 
+              "num_class" = numberOfClasses) 
+
+# Defining training and evaluation sets
+watchlist <- list(train = dtrainlm, 
+                  eval = dtestlm)
+
+# Generating first model using Gradient Boosting Trees
+modellm = xgb.train(param, 
+                    dtrainlm,
+                    nrounds = 75,
+                    watchlist)
+
+```
+
+```{r message=FALSE, cache=FALSE, fig.align="center", fig.width=7, fig.height=5}
+# Computing prediction estimations for the test data
+testlm_pred = predict(modellm, 
+                      newdata = data.matrix(testlm[,features]))
+trainlm_pred = predict(modellm, 
+                       newdata = data.matrix(trainlm[,features]))
+
+testlm$Predictions = testlm_pred
+
+# confusion matrix of test set
+xtablm = createConfusionMatrix(testlm$Facies + 1, 
+                               testlm$Predictions + 1)
+xtablm = t(xtablm)
+rownames(xtablm) <- facies_names[1:8]
+colnames(xtablm) <- facies_names[1:8]
+plotConfusionMatrix(xtablm, relScale = T)
+plotConfusionMatrix(xtab, relScale = T)
+
+# Confucion matrix and statistical information
+u <- union(testlm$Predictions + 1, testlm$Facies + 1)
+t <- table(factor(testlm$Predictions + 1, u), factor(testlm$Facies + 1, u))
+CMlm = confusionMatrix(t,
+                     mode = "everything")
+cat("Accuracy with imputed data:", CMlm$overall[1], '\n')
+cat("Previous accuracy:", CM$overall[1], '\n')
+```
+
+```{r message=FALSE, cache=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+dtemp = testlm
+dtemp$Predictions <- dtemp$Predictions + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs, 
+             facies = "Facies", classy = "Predictions", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+The data imputation of the missing *PE* logs increased the process accuracy, but it is still too low. We need to work with [feature augement](https://en.wikipedia.org/wiki/Augmented_matrix). In others words, we need to use our data to create new features, by using some combination rule.
+
+## Feature Engeneering
+
+Let's do some analysis of the data and do a [pairs plot](https://en.wikipedia.org/wiki/Scatter_plot):
+
+```{r, fig.align = "center", fig.width=10, fig.height=8, message=FALSE, cache=FALSE}
+pm = ggpairs(datalm, 
+             columns = match(c(well_logs), colnames(datalm)),
+             aes(colour = factor(Facies), 
+                 alpha = 0.3),
+             diag = list(continuous = "barDiag"),
+             upper = list(continuous = "density"),
+             lower = list(continuous = "points", combo = "dot_no_facet"),
+             legend = pright)
+
+# Change color manually.
+# Loop through each plot changing relevant scales
+for(i in 1:pm$nrow) {
+  for(j in 1:pm$ncol){
+    pm[i,j] <- pm[i,j] + 
+        scale_fill_manual(values=c(facies_colors)) +
+        scale_color_manual(values=c(facies_colors))  
+  }
+}
+
+pm
+```
+
+### Polar coordinates
+
+We can see some "circular" behavior of the pairs plot and data classification (facies). It is more clear when analyzing the density plots. So, to see if we can improve the facies classification, let's convert the "cardinal" coordinates of the pairs to polar coordinates, using the function *cart2polwells* from the support file *Utils.R*.
+
+```{r message=FALSE, cache=FALSE}
+data_polar = cart2polwells(datalm,well_logs)
+nofeatures = c("Facies","Formation", "Well.Name", "Depth")
+features_pol = colnames(data_polar)
+features_pol = features_pol[! features_pol %in% nofeatures]
+```
+
+Now, with the new coordinates, recreate the test and validation sets and then train the model:
+
+```{r message=FALSE, cache=FALSE}
+# For the xgboost package, target must be from 0 to num_class - 1
+temp <- data_polar
+temp$Facies = temp$Facies - 1
+
+# Splitting data
+trainpol = temp[temp$Well.Name != testWell, ]
+testpol = temp[temp$Well.Name == testWell, ]
+
+# Converting datasets to xgb.DMatrix
+dtrainpol = xgb.DMatrix(data.matrix(trainpol[,features_pol]),
+                        label = data.matrix(trainpol$Facies))
+dtestpol = xgb.DMatrix(data.matrix(testpol[,features_pol]), 
+                       label = data.matrix(testpol$Facies))
+
+mdepth = round(length(features_pol)/2)
+
+# Setting up parameters
+param <- list(max_depth = 5, 
+              eta = .3, 
+              silent = 1, 
+              nthread = 10,
+              objective = "multi:softmax", 
+              eval_metric = "merror", 
+              "num_class" = numberOfClasses) 
+
+# Defining training and evaluation sets
+watchlist <- list(train = dtrainpol,
+                  eval = dtestpol)
+
+# Generating first model using Gradient Boosting Trees
+modelpol = xgb.train(param,
+                     dtrainpol,
+                     nrounds = 47,
+                     watchlist)
+
+```
+Plot confusion matrix and evaluate accuracy:
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=5, fig.align="center"}
+# Computing prediction estimations for the test data
+testpol_pred = predict(modelpol, 
+                       newdata = data.matrix(testpol[,features_pol]))
+trainpol_pred = predict(modelpol, 
+                        newdata = data.matrix(trainpol[,features_pol]))
+
+testpol$Predictions = testpol_pred
+
+# confusion matrix of test set
+xtabpol = createConfusionMatrix(testpol$Facies + 1, 
+                                testpol$Predictions + 1)
+xtabpol = t(xtabpol)
+rownames(xtabpol) <- facies_names[1:8]
+colnames(xtabpol) <- facies_names
+plotConfusionMatrix(xtablm, relScale = T)
+plotConfusionMatrix(xtabpol, relScale = T)
+
+# Confucion matrix an statistical information
+u <- union(testpol$Predictions + 1, testpol$Facies + 1)
+t <- table(factor(testpol$Predictions + 1, u), factor(testpol$Facies + 1, u))
+
+# Confucion matrix and statistical information
+CMpol = confusionMatrix(t,
+                        mode = "everything")
+cat("Accuracy (polar):   ",CMpol$overall[1], "\n")
+cat("Accuracy (LM):      ",CMlm$overall[1], "\n")
+cat("Accuracy (original):",CM$overall[1], "\n")
+```
+
+```{r message=FALSE, cache=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+dtemp = testpol
+dtemp$Predictions <- dtemp$Predictions + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs, 
+             facies = "Facies", classy = "Predictions", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+### Gradient of the features
+
+With the data imputation and the polar coordinates changes, we could increase the precision of the model by around 3.5 percentual points. Now, others competitors used the feature gradient as new features. Let's do the same by using the function *features_gradient* from the file *Utils.R*:
+
+```{r message=FALSE, cache=FALSE}
+data_grad = features_gradient(data_polar, features_pol, wellname)
+features_grad = colnames(data_grad)
+features_grad = features_grad[! features_grad %in% nofeatures]
+```
+
+Now, new model training:
+
+```{r message=FALSE, cache=FALSE}
+# For the xgboost package, target must be from 0 to num_class - 1
+temp <- data_grad
+temp$Facies = temp$Facies - 1
+
+# Splitting data
+traingrad = temp[temp$Well.Name != testWell, ]
+testgrad = temp[temp$Well.Name == testWell, ]
+
+# Converting datasets to xgb.DMatrix
+dtraingrad = xgb.DMatrix(data.matrix(traingrad[,features_grad]),
+                         label = data.matrix(traingrad$Facies))
+dtestgrad = xgb.DMatrix(data.matrix(testgrad[,features_grad]),
+                        label = data.matrix(testgrad$Facies))
+mdepth = round(length(features_grad)/2)
+
+# Setting up parameters
+param <- list(max_depth = 7, 
+              eta = .3, 
+              silent = 1, 
+              nthread = 2,
+              objective = "multi:softmax", 
+              eval_metric = "merror", 
+              "num_class" = numberOfClasses) 
+
+# Defining training and evaluation sets
+watchlist <- list(train = dtraingrad,
+                  eval = dtestgrad)
+
+# Generating first model using Gradient Boosting Trees
+modelgrad = xgb.train(param,
+                      dtraingrad,
+                      nrounds = 11,
+                      watchlist)
+
+```
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=5, fig.align="center"}
+# Computing prediction estimations for the test data
+testgrad_pred = predict(modelgrad, 
+                        newdata = data.matrix(testgrad[,features_grad]))
+traingrad_pred = predict(modelgrad, 
+                         newdata = data.matrix(traingrad[,features_grad]))
+
+testgrad$Predictions = testgrad_pred
+
+# confusion matrix of test set
+xtabgrad = createConfusionMatrix(testgrad$Facies + 1, 
+                                 testgrad$Predictions + 1)
+xtabgrad = t(xtabgrad)
+rownames(xtabgrad) <- facies_names[1:8]
+colnames(xtabgrad) <- facies_names[1:8]
+plotConfusionMatrix(xtabgrad, relScale = T)
+plotConfusionMatrix(xtabpol, relScale = T)
+
+# Confucion matrix and statistical information
+u <- union(testgrad$Predictions + 1, testgrad$Facies + 1)
+t <- table(factor(testgrad$Predictions + 1, u), factor(testgrad$Facies + 1, u))
+CMgrad = confusionMatrix(t,
+                         mode = "everything")
+cat("Accuracy (gradient):",CMgrad$overall[1], "\n")
+cat("Accuracy (polar):   ",CMpol$overall[1], "\n")
+cat("Accuracy (LM):      ",CMlm$overall[1], "\n")
+cat("Accuracy (original):",CM$overall[1], "\n")
+```
+
+```{r message=FALSE, cache=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+dtemp = testgrad
+dtemp$Predictions <- dtemp$Predictions + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs, 
+             facies = "Facies", classy = "Predictions", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+
+Creating the gradient over all the features showed to be an excellent decision, and the accuracy is increased. To deliver the final facies classification predictions, we assume that isolated facies inside a "block" is something rare (not impossible, though). So, we will "fix" is by applying a median filter.
+
+## Correcting the predictions
+
+From the package **signal**, we will use the function *medfilt1* to filter isolated classified facies in an area, by replacing it with the median of the window.
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=5, fig.align="center"}
+testgrad2 = testgrad
+testgrad2$Classy = testgrad_pred
+for (w in wellname){
+  testgrad2[which(testgrad2$Well.Name %in% w), "Classy"] = 
+    runmed(testgrad2[which(testgrad2$Well.Name %in% w), "Classy"],
+           k = 5, endrule = c("keep"))
+}
+
+u = union(testgrad2$Facies, testgrad2$Predictions)
+
+# confusion matrix of test set
+xtabgrad2 = createConfusionMatrix(testgrad2$Facies + 1, 
+                                  testgrad2$Classy + 1)
+xtabgrad2 = t(xtabgrad2)
+rownames(xtabgrad2) <- facies_names[1:8]
+colnames(xtabgrad2) <- facies_names[1:8]
+plotConfusionMatrix(xtabgrad, relScale = T)
+plotConfusionMatrix(xtabgrad2, relScale = T)
+
+u <- union(testgrad2$Classy + 1, testgrad2$Facies + 1)
+t <- table(factor(testgrad2$Classy + 1, u), factor(testgrad2$Facies + 1, u))
+
+# Confucion matrix and statistical information
+CMgrad2 = confusionMatrix(t,
+                          mode = "everything")
+cat("Accuracy (gradient):",CMgrad2$overall[1], "\n")
+```
+Plotting the final predictions:
+
+```{r message=FALSE, cache=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+dtemp = testgrad2
+dtemp$Classy <- dtemp$Classy + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs,
+             facies = "Facies", classy = "Classy", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+Chacking features importance:
+
+```{r message=FALSE, cache=FALSE,  fig.width=9, fig.height=5}
+importance <- xgb.importance(feature_names = features_grad, model = modelgrad)
+xgb.ggplot.importance(importance, top_n = 10, measure = "Gain", rel_to_first = T, n_clusters = 5)
+```
+
+The choice of the package **xgboost** led us to a very accurate facies classification, even considering the low amount of data to train the *gradient boosting trees* models.
+
+## Clustering
+
+Now, let's try to run a clustering algorithm to create new features. Clustering algorithms, for this purpose, are considered "unsupervised learning", as they don't require to be trained with the correct answer. Those algorithms just find similarities between the data intupts and separate them in clusters.
+
+The next cell will replace missing values of the data by 0 and, after, use the kmeans to create 5 clusters in the data.
+```{r}
+set.seed(101)
+
+# Features not used for the clustering
+no_clust = c("RELPOS", "NM_M", "RELPOS_grad", "NM_M_grad")
+features_cluster = features_grad[! features_grad %in% no_clust]
+
+# Replacing missing values by 0
+for (x in features_cluster) {
+  data_grad[is.na(data_grad[,x]), x] <- 0
+}
+
+#features_cluster = features_grad[features_grad != no_clust]
+Cluster = kmeans(as.matrix(data_grad[,features_cluster]), 6)
+data_grad$cluster = as.factor(Cluster$cluster)
+head(data_grad)
+```
+
+Training the classifier:
+
+```{r message=FALSE, cache=FALSE}
+# For the xgboost package, target must be from 0 to num_class - 1
+temp <- data_grad
+temp$Facies = temp$Facies - 1
+
+# Splitting data
+trainclust = temp[temp$Well.Name != testWell, ]
+testclust = temp[temp$Well.Name == testWell, ]
+
+# New set of features
+features_clust = c(features_grad,"cluster")
+
+# Converting datasets to xgb.DMatrix
+dtrainclust = xgb.DMatrix(data.matrix(trainclust[,features_clust]),
+                          label = data.matrix(trainclust$Facies))
+dtestclust = xgb.DMatrix(data.matrix(testclust[,features_clust]),
+                         label = data.matrix(testclust$Facies))
+mdepth = round(length(features_clust)/2)
+
+# Setting up parameters
+param <- list(max_depth = 8, 
+              eta = .3, 
+              silent = 1, 
+              nthread = 2,
+              objective = "multi:softmax", 
+              eval_metric = "merror", 
+              "num_class" = numberOfClasses) 
+
+# Defining training and evaluation sets
+watchlist <- list(train = dtrainclust,
+                  eval = dtestclust)
+
+# Generating first model using Gradient Boosting Trees
+modelclust = xgb.train(param,
+                       dtrainclust,
+                       nrounds = 27,
+                       watchlist)
+
+```
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=5, fig.align="center"}
+# Computing prediction estimations for the test data
+testclust_pred = predict(modelclust, 
+                         newdata = data.matrix(testclust[,features_clust]))
+trainclust_pred = predict(modelclust, 
+                          newdata = data.matrix(trainclust[,features_clust]))
+
+testclust$Predictions = testclust_pred
+
+# confusion matrix of test set
+xtabclust = createConfusionMatrix(testclust$Facies + 1, 
+                                  testclust$Predictions + 1)
+xtabclust = t(xtabclust)
+rownames(xtabgrad) <- facies_names[1:8]
+colnames(xtabgrad) <- facies_names[1:8]
+plotConfusionMatrix(xtabgrad, relScale = T)
+plotConfusionMatrix(xtabclust, relScale = T)
+
+# Confucion matrix and statistical information
+u <- union(testclust$Predictions + 1, testclust$Facies + 1)
+t <- table(factor(testclust$Predictions + 1, u), factor(testclust$Facies + 1, u))
+CMclust = confusionMatrix(t,
+                          mode = "everything")
+cat("Accuracy (cluster): ",CMclust$overall[1], "\n")
+cat("Accuracy (gradient):",CMgrad2$overall[1], "\n")
+cat("Accuracy (polar):   ",CMpol$overall[1], "\n")
+cat("Accuracy (LM):      ",CMlm$overall[1], "\n")
+cat("Accuracy (original):",CM$overall[1], "\n")
+```
+
+```{r message=FALSE, cache=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+dtemp = testclust
+dtemp$Predictions <- dtemp$Predictions + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs, 
+             facies = "Facies", classy = "Predictions", fcolor = facies_colors,
+             fnames = facies_names)
+```
+
+```{r message=FALSE, cache=FALSE,  fig.width=7, fig.height=5, fig.align="center"}
+testclust2 = testclust
+testclust2$Classy = testclust_pred
+for (w in wellname){
+  testclust2[which(testclust2$Well.Name %in% w), "Classy"] = 
+    runmed(testclust2[which(testclust2$Well.Name %in% w), "Classy"],
+           k = 5, endrule = c("keep"))
+}
+
+u = union(testclust2$Facies, testclust2$Predictions)
+
+# confusion matrix of test set
+xtabclust2 = createConfusionMatrix(testclust2$Facies + 1, 
+                                   testclust2$Classy + 1)
+xtabclust2 = t(xtabclust2)
+rownames(xtabclust2) <- facies_names[1:8]
+colnames(xtabclust2) <- facies_names[1:8]
+plotConfusionMatrix(xtabclust, relScale = T)
+plotConfusionMatrix(xtabclust2, relScale = T)
+
+u <- union(testclust2$Classy + 1, testclust2$Facies + 1)
+t <- table(factor(testclust2$Classy + 1, u), factor(testclust2$Facies + 1, u))
+
+# Confucion matrix and statistical information
+CMclust2 = confusionMatrix(t,
+                          mode = "everything")
+cat("Accuracy (cluster): ",CMclust2$overall[1], "\n")
+cat("Accuracy (gradient):",CMgrad2$overall[1], "\n")
+cat("Accuracy (polar):   ",CMpol$overall[1], "\n")
+cat("Accuracy (LM):      ",CMlm$overall[1], "\n")
+cat("Accuracy (original):",CM$overall[1], "\n")
+```
+
+```{r message=FALSE, cache=FALSE, fig.width = 10, fig.height = 8, fig.align="center"}
+dtemp = testclust2
+dtemp$Classy <- dtemp$Classy + 1
+dtemp$Facies <- dtemp$Facies + 1
+plotwellPred(datap = dtemp, wname = testWell, dz = "Depth", wlogs = well_logs,
+             facies = "Facies", classy = "Classy", fcolor = facies_colors,
+             fnames = facies_names)
+```
+```{r message=FALSE, cache=FALSE,  fig.width=9, fig.height=5}
+importance <- xgb.importance(feature_names = features_clust, model = modelclust)
+xgb.ggplot.importance(importance, top_n = 10, measure = "Gain", rel_to_first = T, n_clusters = 5)
+```
+
